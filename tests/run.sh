@@ -245,6 +245,9 @@ ov_write '10-hotfix.conf' "$(printf 'types=feat fix chore docs refactor perf tes
 hc 'hotfix: h' && ok || fail 'override: new type accepted by hook'
 assert_eq 'override: new type bumps' '1.2.1' "$(hv version HEAD --strip-suffix)"
 ov_reset
+# range base for later lint-range: past the hotfix commit, whose type
+# override no longer applies after the reset above
+OV_BASE="$(git -C "$HOST" rev-parse HEAD)"
 
 ov_write '10-ignore.conf' "$(printf 'ignore_re=^WIP\nignore_re=^feat\\(x\\)')"
 # the hook does not honor ignore_re (codified current behavior)
@@ -254,7 +257,7 @@ else
 	ok
 fi
 hc_nv 'WIP: wip work'
-assert_exit 'override: lint-range skips ignored commit' 0 "$(hvrc lint-range "$C8" HEAD)"
+assert_exit 'override: lint-range skips ignored commit' 0 "$(hvrc lint-range "$OV_BASE" HEAD)"
 assert_eq 'override: ignored feat(x) changes fold' '1.1.0' "$(hv version "$C7" --strip-suffix)"
 assert_eq 'override: WIP commit does not bump' '1.1.0' "$(hv version HEAD --strip-suffix)"
 hv changelog HEAD -o "$WORK/cl-wip.md" >/dev/null
@@ -273,7 +276,8 @@ git -C "$HOST" checkout -q -b release/staging
 H6="$(git -C "$HOST" rev-parse --short=7 HEAD)"
 assert_eq 'suffix default: strip_prefix release/' "1.2.0-staging.${H6}" "$(hv version)"
 ov_write '10-strip.conf' 'strip_prefix='
-assert_eq 'override: empty strip_prefix keeps full name' "1.2.0-release-staging.${H6}" "$(hv version)"
+# ov_write commits a new (noop) chore commit, so the suffix hash moves
+assert_eq 'override: empty strip_prefix keeps full name' "1.2.0-release-staging.$(git -C "$HOST" rev-parse --short=7 HEAD)" "$(hv version)"
 git -C "$HOST" checkout -q main
 git -C "$HOST" branch -q -D release/staging
 ov_reset

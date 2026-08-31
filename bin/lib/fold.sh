@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # policy variables are read by the sibling libs
 # versioner semver fold
 #
 # version(C) = fold over the full reachable history of commit C
@@ -6,9 +8,12 @@
 #   major -> M+1.0.0 ; minor -> M.m+1.0 ; patch -> M.m.p+1
 # Non-conventional and ignored commits never bump.
 #
-# This makes the version a pure function of the commit: the same commit
-# always yields the same version on any branch. Tags are pins that can be
-# verified with `versioner check-tag`, not inputs to the computation.
+# The bare X.Y.Z is a pure function of the commit: the same commit always
+# yields the same version on any branch and in any checkout. Tags are pins
+# that can be verified with `versioner check-tag`, not inputs.
+
+# A BREAKING CHANGE footer only counts at the start of a line.
+VERSIONER_BREAKING_RE=$'\nBREAKING[- ]CHANGE:'
 
 # Parse a commit header (+ full message for footer detection).
 # Sets: BUMP_TYPE BUMP_SCOPE BUMP_SUBJECT BUMP_BREAKING BUMP_LEVEL
@@ -31,54 +36,46 @@ parse_bump() {
 	fi
 	if [ -n "${BASH_REMATCH[4]:-}" ]; then
 		BUMP_BREAKING=1
-	elif [ -n "$msg" ] && printf '%s\n' "$msg" | grep -Eq '^BREAKING[- ]CHANGE:'; then
+	elif [ -n "$msg" ] && [[ $'\n'"$msg" =~ $VERSIONER_BREAKING_RE ]]; then
 		BUMP_BREAKING=1
 	fi
+	# read the map directly: a $(bump_for_type) subshell here would fork once
+	# per commit and dominate the runtime on a large history
 	if [ "$BUMP_BREAKING" = 1 ]; then
-		BUMP_LEVEL="$(bump_for_type breaking)"
+		BUMP_LEVEL="${BUMP_LEVEL_OF[breaking]:-}"
 	else
-		BUMP_LEVEL="$(bump_for_type "$BUMP_TYPE")"
+		BUMP_LEVEL="${BUMP_LEVEL_OF[$BUMP_TYPE]:-}"
 	fi
+	return 0
+}
+
+# Apply one commit to the running _FOLD_* counters.
+_fold_apply() {
+	local msg="$3" header
+	header="${msg%%$'\n'*}"
+	config_is_ignored "$header" && return 0
+	parse_bump "$header" "$msg" || return 0
+	case "${BUMP_LEVEL:-}" in
+	major)
+		_FOLD_MAJOR=$((_FOLD_MAJOR + 1))
+		_FOLD_MINOR=0
+		_FOLD_PATCH=0
+		;;
+	minor)
+		_FOLD_MINOR=$((_FOLD_MINOR + 1))
+		_FOLD_PATCH=0
+		;;
+	patch) _FOLD_PATCH=$((_FOLD_PATCH + 1)) ;;
+	esac
 	return 0
 }
 
 # Print the computed semver of a commit (default HEAD). No suffix.
 fold_version() {
-	local commit="${1:-HEAD}" major=0 minor=0 patch=0
-	local out h msg header
-	git rev-parse -q --verify "${commit}^{commit}" >/dev/null || {
-		printf 'versioner: unknown commit: %s\n' "$commit" >&2
-		return 1
-	}
-	out="$(git log --topo-order --reverse --format='%H%x01%B%x02' "$commit")" || return 1
-	while [ -n "$out" ]; do
-		h="${out%%$'\x01'*}"
-		out="${out#*$'\x01'}"
-		msg="${out%%$'\x02'*}"
-		if [[ "$out" == *$'\x02'* ]]; then
-			out="${out#*$'\x02'}"
-		else
-			out=""
-		fi
-		header="${msg%%$'\n'*}"
-		if config_is_ignored "$header"; then
-			continue
-		fi
-		if ! parse_bump "$header" "$msg"; then
-			continue
-		fi
-		case "${BUMP_LEVEL:-}" in
-		major)
-			major=$((major + 1))
-			minor=0
-			patch=0
-			;;
-		minor)
-			minor=$((minor + 1))
-			patch=0
-			;;
-		patch) patch=$((patch + 1)) ;;
-		esac
-	done
-	printf '%d.%d.%d\n' "$major" "$minor" "$patch"
+	local commit="${1:-HEAD}"
+	_FOLD_MAJOR=0
+	_FOLD_MINOR=0
+	_FOLD_PATCH=0
+	history_each "$commit" _fold_apply || return 1
+	printf '%d.%d.%d\n' "$_FOLD_MAJOR" "$_FOLD_MINOR" "$_FOLD_PATCH"
 }

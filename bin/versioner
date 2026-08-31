@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 # versioner — conventional-commit versioning: lint, compute, changelog, release.
+#
+# Exit codes:  0 ok · 1 policy failure (lint failed, tag mismatch) · 2 usage or
+# configuration error.
 set -euo pipefail
 
 VERSIONER_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-for _lib in config commitlint fold suffix changelog; do
+for _lib in config commitlint history fold suffix changelog; do
 	# shellcheck disable=SC1091
 	. "${VERSIONER_HOME}/bin/lib/${_lib}.sh"
 done
 unset _lib
 config_load
+
+die() { # <exit-code> <message...>
+	local rc="$1"
+	shift
+	printf 'versioner: %s\n' "$*" >&2
+	exit "$rc"
+}
+
+json_escape() {
+	local s="$1"
+	s="${s//\\/\\\\}"
+	s="${s//\"/\\\"}"
+	printf '%s' "$s"
+}
 
 usage() {
 	cat <<'EOF'
@@ -17,39 +34,150 @@ versioner — conventional-commit versioning
 usage: versioner <command> [args]
 
 commands:
-  install                          install the commit-msg hook into .git/hooks
+  init [--force]                   wire versioner into the surrounding repo: hook,
+                                   CI workflow stubs, external-overrides/ skeleton
+  install [--force]                install the commit-msg hook only
   lint-msg <file>                  validate one commit message file (hook entrypoint)
-  lint-range <base> <head>         validate all non-ignored commits in merge-base(base,head)..head
-  version [commit] [--strip-suffix]
+  lint-range <base> [head]         validate all non-ignored commits in
+                                   merge-base(base,head)..head  (head defaults to HEAD)
+  version [commit] [--strip-suffix] [--branch <name>] [--json]
                                    print computed version (default HEAD; suffix
                                    X.Y.Z-<branch>.<hash> off production branches,
                                    bare X.Y.Z on production; --strip-suffix drops it)
   changelog [ref] [-o file]        regenerate CHANGELOG.md (default ref HEAD, file CHANGELOG.md)
-  release [--push]                 compute version, regenerate changelog, commit,
-                                   annotated tag; --push also pushes branch + tag
-  check-tag <tag>                  verify tag name matches the computed version of
+  release [--push] [--any-branch]  compute version, regenerate changelog, commit,
+                                   annotated tag; --push also pushes branch + tag.
+                                   Refuses a detached HEAD and non-production branches.
+  check-tag <tag> [--json]         verify tag name matches the computed version of
                                    its tagged commit
+  config [--json]                  print the effective policy and where each key came from
   help                             this text
 
 policy (types, bump map, ignore regexes, suffix rules, tag prefix) comes from
 defaults/*.conf, overridable via <parent repo>/external-overrides/*.conf
-(buildroot-style) or $VERSIONER_OVERRIDES_DIR. See README.md.
+(buildroot-style) or $VERSIONER_OVERRIDES_DIR. See AGENTS.md and README.md.
 EOF
 }
 
-release_cmd() {
-	local push=0 v tag tagged
-	if [ "${1:-}" = "--push" ]; then
-		push=1
+config_cmd() {
+	local json=0 a k
+	for a in "$@"; do
+		case "$a" in
+		--json) json=1 ;;
+		*) die 2 "config: unexpected argument: $a" ;;
+		esac
+	done
+	if [ "$json" = 1 ]; then
+		printf '{\n'
+		printf '  "versioner_home": "%s",\n' "$(json_escape "$VERSIONER_HOME")"
+		printf '  "overrides_dir": "%s",\n' "$(json_escape "${VERSIONER_OVERRIDES_DIR_USED:-}")"
+		printf '  "types": "%s",\n' "$(json_escape "$TYPES")"
+		printf '  "production_branches": "%s",\n' "$(json_escape "$PRODUCTION_BRANCHES")"
+		printf '  "strip_prefix": "%s",\n' "$(json_escape "$STRIP_PREFIX")"
+		printf '  "hash_len": %s,\n' "$HASH_LEN"
+		printf '  "tag_prefix": "%s",\n' "$(json_escape "$TAG_PREFIX")"
+		printf '  "subject_max": %s,\n' "$SUBJECT_MAX"
+		printf '  "bump": {'
+		local first=1
+		for k in $(printf '%s\n' "${!BUMP_LEVEL_OF[@]}" | sort); do
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '\n    "%s": "%s"' "$(json_escape "$k")" "$(json_escape "${BUMP_LEVEL_OF[$k]}")"
+		done
+		printf '\n  },\n'
+		printf '  "ignore_re": ['
+		first=1
+		while IFS= read -r k; do
+			[ -n "$k" ] || continue
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '\n    "%s"' "$(json_escape "$k")"
+		done <<<"$IGNORE_RES"
+		printf '\n  ]\n}\n'
+		return 0
 	fi
+	printf 'versioner policy (later sources win)\n'
+	printf '  defaults:   %s/defaults/*.conf\n' "$VERSIONER_HOME"
+	printf '  overrides:  %s%s\n' "${VERSIONER_OVERRIDES_DIR_USED:-}" \
+		"$([ -d "${VERSIONER_OVERRIDES_DIR_USED:-/nonexistent}" ] || printf ' (absent)')"
+	printf '\n'
+	printf '  %-22s %s\n' "types" "$TYPES"
+	printf '  %-22s %s\n' "production_branches" "$PRODUCTION_BRANCHES"
+	printf '  %-22s %s\n' "strip_prefix" "$STRIP_PREFIX"
+	printf '  %-22s %s\n' "hash_len" "$HASH_LEN"
+	printf '  %-22s %s\n' "tag_prefix" "$TAG_PREFIX"
+	printf '  %-22s %s\n' "subject_max" "$SUBJECT_MAX"
+	printf '\n  bump map:\n'
+	for k in $(printf '%s\n' "${!BUMP_LEVEL_OF[@]}" | sort); do
+		printf '    %-20s %-6s (%s)\n' "$k" "${BUMP_LEVEL_OF[$k]}" "${CONF_SRC[bump.$k]:-seed}"
+	done
+	printf '\n  ignore_re:\n'
+	while IFS= read -r k; do
+		[ -n "$k" ] || continue
+		printf '    %s\n' "$k"
+	done <<<"$IGNORE_RES"
+}
+
+version_cmd() {
+	local commit="HEAD" strip=0 json=0 a want_branch=0
+	for a in "$@"; do
+		if [ "$want_branch" = 1 ]; then
+			# shellcheck disable=SC2034  # read by resolve_branch in suffix.sh
+			VERSIONER_BRANCH="$a"
+			want_branch=0
+			continue
+		fi
+		case "$a" in
+		--strip-suffix) strip=1 ;;
+		--json) json=1 ;;
+		--branch) want_branch=1 ;;
+		--*) die 2 "version: unknown option: $a" ;;
+		*) commit="$a" ;;
+		esac
+	done
+	[ "$want_branch" = 0 ] || die 2 "version: --branch needs a value"
+	local full base sha branch prod
+	full="$(computed_version "$commit" "$strip")" || exit 1
+	if [ "$json" = 0 ]; then
+		printf '%s\n' "$full"
+		return 0
+	fi
+	base="$(fold_version "$commit")"
+	sha="$(git rev-parse "$commit")"
+	branch="$(resolve_branch "$commit")"
+	if is_production_branch "$branch"; then prod=true; else prod=false; fi
+	printf '{"version":"%s","base":"%s","commit":"%s","short":"%s","branch":"%s","production":%s}\n' \
+		"$(json_escape "$full")" "$(json_escape "$base")" "$sha" \
+		"$(git rev-parse --short="$HASH_LEN" "$commit")" "$(json_escape "$branch")" "$prod"
+}
+
+release_cmd() {
+	local push=0 any=0 a v tag tagged branch
+	for a in "$@"; do
+		case "$a" in
+		--push) push=1 ;;
+		--any-branch) any=1 ;;
+		*) die 2 "release: unexpected argument: $a" ;;
+		esac
+	done
+	branch="$(git symbolic-ref --short -q HEAD 2>/dev/null)" || branch=""
+	[ -n "$branch" ] || die 2 "release: HEAD is detached; check out the production branch first (CI: actions/checkout with a branch ref)"
+	if [ "$any" != 1 ] && ! is_production_branch "$branch"; then
+		die 2 "release: '${branch}' is not a production branch (${PRODUCTION_BRANCHES}); pass --any-branch to override"
+	fi
+	git diff --cached --quiet || die 2 "release: the index has staged changes; commit or reset them first"
 	v="$(fold_version HEAD)"
 	tag="${TAG_PREFIX}${v}"
 	if git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null 2>&1; then
 		tagged="$(git rev-list -n1 "refs/tags/${tag}")"
-		if git merge-base --is-ancestor "$tagged" HEAD 2>/dev/null && [ "$(fold_version "$tagged")" = "$v" ]; then
-			printf 'versioner: up to date at %s (no new version)\n' "$tag"
-			return 0
+		if ! git merge-base --is-ancestor "$tagged" HEAD 2>/dev/null; then
+			die 2 "release: tag ${tag} already exists at ${tagged:0:$HASH_LEN}, which is not in HEAD's history"
 		fi
+		if [ "$(fold_version "$tagged")" != "$v" ]; then
+			die 2 "release: tag ${tag} already exists at ${tagged:0:$HASH_LEN} but that commit computes to $(fold_version "$tagged")"
+		fi
+		printf 'versioner: up to date at %s (no new version)\n' "$tag"
+		return 0
 	fi
 	changelog_generate HEAD CHANGELOG.md
 	git add CHANGELOG.md
@@ -61,31 +189,46 @@ release_cmd() {
 	git tag -a "$tag" -m "$tag"
 	printf 'versioner: tagged %s at %s\n' "$tag" "$(git rev-parse --short="$HASH_LEN" HEAD)"
 	if [ "$push" = 1 ]; then
-		git push origin HEAD "refs/tags/${tag}"
+		git push origin "HEAD:refs/heads/${branch}" "refs/tags/${tag}"
 	fi
 }
 
 check_tag() {
-	local tag="$1" name="$1" commit v
+	local tag="" json=0 a name commit v ok
+	for a in "$@"; do
+		case "$a" in
+		--json) json=1 ;;
+		--*) die 2 "check-tag: unknown option: $a" ;;
+		*) tag="$a" ;;
+		esac
+	done
+	[ -n "$tag" ] || die 2 "check-tag: needs a tag name"
+	name="$tag"
 	case "$name" in
 	"${TAG_PREFIX}"*) name="${name#"${TAG_PREFIX}"}" ;;
 	esac
 	commit="$(git rev-list -n1 "refs/tags/${tag}" 2>/dev/null)" || {
-		printf 'versioner: tag not found: %s\n' "$tag" >&2
-		return 1
+		[ "$json" = 1 ] && printf '{"tag":"%s","found":false}\n' "$(json_escape "$tag")"
+		die 2 "tag not found: $tag"
 	}
 	v="$(fold_version "$commit")"
-	if [ "$v" = "$name" ]; then
+	if [ "$v" = "$name" ]; then ok=true; else ok=false; fi
+	if [ "$json" = 1 ]; then
+		printf '{"tag":"%s","found":true,"commit":"%s","computed":"%s","ok":%s}\n' \
+			"$(json_escape "$tag")" "$commit" "$(json_escape "$v")" "$ok"
+	elif [ "$ok" = true ]; then
 		printf 'versioner: OK: %s == %s\n' "$tag" "$v"
-		return 0
+	else
+		printf 'versioner: MISMATCH: %s but computed %s\n' "$tag" "$v" >&2
 	fi
-	printf 'versioner: MISMATCH: %s but computed %s\n' "$tag" "$v" >&2
-	return 1
+	[ "$ok" = true ] || return 1
+	return 0
 }
 
 cmd="${1:-help}"
 shift || true
 case "$cmd" in
+init) exec bash "${VERSIONER_HOME}/bin/init.sh" "$@" ;;
 install) exec bash "${VERSIONER_HOME}/install.sh" "$@" ;;
 lint-msg)
 	[ "$#" -ge 1 ] || { usage >&2; exit 2; }
@@ -95,28 +238,24 @@ lint-range)
 	[ "$#" -ge 1 ] || { usage >&2; exit 2; }
 	commitlint_range "$1" "${2:-HEAD}"
 	;;
-version)
-	commit="HEAD"
-	strip=0
-	for a in "$@"; do
-		case "$a" in
-		--strip-suffix) strip=1 ;;
-		*) commit="$a" ;;
-		esac
-	done
-	computed_version "$commit" "$strip"
-	;;
+version) version_cmd "$@" ;;
 changelog)
 	ref="HEAD"
 	file="CHANGELOG.md"
+	seen_ref=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 		-o)
-			[ "$#" -ge 2 ] || { printf 'versioner: -o needs a value\n' >&2; exit 2; }
+			[ "$#" -ge 2 ] || die 2 "changelog: -o needs a value"
 			file="$2"
 			shift
 			;;
-		*) ref="$1" ;;
+		--*) die 2 "changelog: unknown option: $1" ;;
+		*)
+			[ "$seen_ref" = 0 ] || die 2 "changelog: unexpected argument: $1"
+			ref="$1"
+			seen_ref=1
+			;;
 		esac
 		shift
 	done
@@ -124,10 +263,8 @@ changelog)
 	printf 'versioner: wrote %s\n' "$file"
 	;;
 release) release_cmd "$@" ;;
-check-tag)
-	[ "$#" -ge 1 ] || { usage >&2; exit 2; }
-	check_tag "$1"
-	;;
+check-tag) check_tag "$@" ;;
+config) config_cmd "$@" ;;
 help | -h | --help) usage ;;
 *)
 	printf 'versioner: unknown command: %s\n' "$cmd" >&2

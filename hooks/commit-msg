@@ -1,3 +1,11 @@
 #!/usr/bin/env bash
 # Managed by versioner install — local edits are lost on reinstall.
-exec "__VERSIONER__" lint-msg "$1"
+# The path below is resolved at runtime, so the repo can be moved or re-cloned
+# to a different location without reinstalling.
+set -euo pipefail
+VERSIONER_BIN="__VERSIONER_BIN__"
+case "$VERSIONER_BIN" in
+/*) ;;
+*) VERSIONER_BIN="$(git rev-parse --show-toplevel)/${VERSIONER_BIN}" ;;
+esac
+exec "$VERSIONER_BIN" lint-msg "$1"

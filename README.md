@@ -159,12 +159,30 @@ changelog and the version always agree).
 ## Tests
 
 ```sh
-tests/run.sh
+tests/run.sh            # add KEEP=1 to keep the scratch dir for inspection
 ```
 
-Dep-free bash harness: builds throwaway repos with scripted histories and
-asserts on fold, suffix, lint, range, changelog, release idempotency,
-overrides and the installed hook.
+Dep-free bash harness. One end-to-end workflow: it mirrors this repo to a
+bare origin, initializes a dummy parent repo, adds versioner as a real git
+submodule, installs the commit-msg hook, then scripts a conventional-commit
+history (with the hook active) and asserts on:
+
+- fold / suffix / lint-msg / lint-range / changelog / release idempotency
+- the installed hook accepting valid and rejecting invalid messages
+- **every policy key** overridden through the parent's tracked
+  `external-overrides/` (`types`, `bump.<type>`, `ignore_re`,
+  `production_branches`, `strip_prefix`, `hash_len`, `tag_prefix`,
+  `subject_max`), including file layering and the
+  `VERSIONER_OVERRIDES_DIR` env dir (which replaces, not layers on, the
+  default dir)
+- a release driven by overridden `tag_prefix`
+- a fresh clone of the parent: submodule + parent overrides carried over
+- a purity guard: the submodule gitlink and its working tree are never
+  modified by any of the above
+
+Known codified gap: the commit-msg hook does **not** honor `ignore_re`
+(only `lint-range`, the fold and the changelog do). Scratch dir
+`tests/tmp/` is gitignored.
 
 ## Notes & caveats
 

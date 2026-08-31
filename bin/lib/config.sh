@@ -65,7 +65,7 @@ _versioner_read_conf_file() {
 				IGNORE_RES="${IGNORE_RES}"$'\n'"${val}"
 				;;
 			*)
-				printf -v "$key" '%s' "$val"
+				printf -v "${key^^}" '%s' "$val"
 				;;
 		esac
 	done <"$file"

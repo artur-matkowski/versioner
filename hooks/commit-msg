@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Managed by versioner install — local edits are lost on reinstall.
+exec "__VERSIONER__" lint-msg "$1"

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# versioner — conventional-commit versioning: lint, compute, changelog, release.
+set -euo pipefail
+
+VERSIONER_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+for _lib in config commitlint fold suffix changelog; do
+	# shellcheck disable=SC1091
+	. "${VERSIONER_HOME}/bin/lib/${_lib}.sh"
+done
+unset _lib
+config_load
+
+usage() {
+	cat <<'EOF'
+versioner — conventional-commit versioning
+
+usage: versioner <command> [args]
+
+commands:
+  install                          install the commit-msg hook into .git/hooks
+  lint-msg <file>                  validate one commit message file (hook entrypoint)
+  lint-range <base> <head>         validate all non-ignored commits in merge-base(base,head)..head
+  version [commit] [--strip-suffix]
+                                   print computed version (default HEAD; suffix
+                                   X.Y.Z-<branch>.<hash> off production branches,
+                                   bare X.Y.Z on production; --strip-suffix drops it)
+  changelog [ref] [-o file]        regenerate CHANGELOG.md (default ref HEAD, file CHANGELOG.md)
+  release [--push]                 compute version, regenerate changelog, commit,
+                                   annotated tag; --push also pushes branch + tag
+  check-tag <tag>                  verify tag name matches the computed version of
+                                   its tagged commit
+  help                             this text
+
+policy (types, bump map, ignore regexes, suffix rules, tag prefix) comes from
+defaults/*.conf, overridable via <parent repo>/external-overrides/*.conf
+(buildroot-style) or $VERSIONER_OVERRIDES_DIR. See README.md.
+EOF
+}
+
+release_cmd() {
+	local push=0 v tag tagged
+	if [ "${1:-}" = "--push" ]; then
+		push=1
+	fi
+	v="$(fold_version HEAD)"
+	tag="${TAG_PREFIX}${v}"
+	if git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null 2>&1; then
+		tagged="$(git rev-list -n1 "refs/tags/${tag}")"
+		if git merge-base --is-ancestor "$tagged" HEAD 2>/dev/null && [ "$(fold_version "$tagged")" = "$v" ]; then
+			printf 'versioner: up to date at %s (no new version)\n' "$tag"
+			return 0
+		fi
+	fi
+	changelog_generate HEAD CHANGELOG.md
+	git add CHANGELOG.md
+	if git diff --cached --quiet; then
+		printf 'versioner: changelog unchanged\n'
+	else
+		git commit -q -m "chore(release): ${tag}"
+	fi
+	git tag -a "$tag" -m "$tag"
+	printf 'versioner: tagged %s at %s\n' "$tag" "$(git rev-parse --short="$HASH_LEN" HEAD)"
+	if [ "$push" = 1 ]; then
+		git push origin HEAD "refs/tags/${tag}"
+	fi
+}
+
+check_tag() {
+	local tag="$1" name="$1" commit v
+	case "$name" in
+	"${TAG_PREFIX}"*) name="${name#"${TAG_PREFIX}"}" ;;
+	esac
+	commit="$(git rev-list -n1 "refs/tags/${tag}" 2>/dev/null)" || {
+		printf 'versioner: tag not found: %s\n' "$tag" >&2
+		return 1
+	}
+	v="$(fold_version "$commit")"
+	if [ "$v" = "$name" ]; then
+		printf 'versioner: OK: %s == %s\n' "$tag" "$v"
+		return 0
+	fi
+	printf 'versioner: MISMATCH: %s but computed %s\n' "$tag" "$v" >&2
+	return 1
+}
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+install) exec bash "${VERSIONER_HOME}/install.sh" "$@" ;;
+lint-msg)
+	[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+	commitlint_msg_file "$1"
+	;;
+lint-range)
+	[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+	commitlint_range "$1" "${2:-HEAD}"
+	;;
+version)
+	commit="HEAD"
+	strip=0
+	for a in "$@"; do
+		case "$a" in
+		--strip-suffix) strip=1 ;;
+		*) commit="$a" ;;
+		esac
+	done
+	computed_version "$commit" "$strip"
+	;;
+changelog)
+	ref="HEAD"
+	file="CHANGELOG.md"
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		-o)
+			[ "$#" -ge 2 ] || { printf 'versioner: -o needs a value\n' >&2; exit 2; }
+			file="$2"
+			shift
+			;;
+		*) ref="$1" ;;
+		esac
+		shift
+	done
+	changelog_generate "$ref" "$file"
+	printf 'versioner: wrote %s\n' "$file"
+	;;
+release) release_cmd "$@" ;;
+check-tag)
+	[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+	check_tag "$1"
+	;;
+help | -h | --help) usage ;;
+*)
+	printf 'versioner: unknown command: %s\n' "$cmd" >&2
+	usage >&2
+	exit 2
+	;;
+esac

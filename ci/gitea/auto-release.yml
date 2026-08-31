@@ -1,0 +1,42 @@
+# versioner — Gitea Actions: automatic release on the production branch
+#
+# Copy to <parent repo>/.gitea/workflows/versioner-auto-release.yml
+# Requires: versioner checked out as a submodule at ./versioner.
+#
+# On every push to release/production:
+#   1. computes the version (fold of the whole history)
+#   2. if it changed: regenerates CHANGELOG.md, commits "chore(release): vX.Y.Z",
+#      creates an annotated tag vX.Y.Z, pushes branch + tag
+#   3. if unchanged: no-op (idempotent, race-safe)
+#
+# Needs a token with write access to the repo. Gitea Actions usually provides
+# GITEA_TOKEN automatically; otherwise create a repo token (write: contents)
+# and add it as a secret named GITEA_TOKEN.
+
+name: versioner: auto-release
+
+on:
+  push:
+    branches: [release/production]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "versioner[bot]"
+          git config user.email "versioner@bot"
+
+      - name: Release (changelog + commit + tag + push)
+        run: ./versioner/bin/versioner release --push

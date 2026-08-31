@@ -1,21 +1,19 @@
 # versioner — Gitea Actions: PR gate
 #
-# Copy to <parent repo>/.gitea/workflows/versioner-pr-gate.yml
-# Requires: versioner checked out as a submodule at ./versioner
-# (gitea/act_runner with `submodules: true` support, or a manual
-# `git submodule update --init` step).
+# Copy to <parent repo>/.gitea/workflows/versioner-pr-gate.yml, or let
+# `./versioner/bin/versioner init` write it for you.
 #
-# Validates ONLY the commits added by the PR (merge-base..HEAD), so a repo
-# that adopts versioner mid-history is never blocked by legacy commits.
+# This file is a thin trigger on purpose: the logic lives in the submodule at
+# versioner/ci/pr-gate.sh, so `git submodule update --remote` picks up fixes
+# without editing anything in the parent repo.
+#
+# Validates ONLY the commits added by the PR (merge-base..HEAD), so a repo that
+# adopts versioner mid-history is never blocked by legacy commits.
 
 name: versioner: PR gate
 
 on:
   pull_request:
-
-env:
-  # Adjust to your default branch.
-  VERSIONER_BASE_BRANCH: main
 
 jobs:
   lint-commits:
@@ -28,8 +26,5 @@ jobs:
           submodules: true
 
       - name: Lint PR commits
-        run: |
-          set -euo pipefail
-          BASE="origin/${VERSIONER_BASE_BRANCH}"
-          git rev-parse --verify "$BASE" >/dev/null 2>&1 || git fetch origin "${VERSIONER_BASE_BRANCH}"
-          ./versioner/bin/versioner lint-range "$BASE" HEAD
+        # Set VERSIONER_BASE_BRANCH only if your Gitea does not export a PR base ref.
+        run: ./versioner/ci/pr-gate.sh

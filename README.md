@@ -244,3 +244,7 @@ and lints versioner's own commits with versioner.
 - Gitea Actions context variable names differ between Gitea versions; the
   stubs pass no PR-context variables, and `ci/pr-gate.sh` falls back through
   several conventions, so they are version-stable.
+  
+## License
+
+MIT — see [LICENSE](LICENSE).
